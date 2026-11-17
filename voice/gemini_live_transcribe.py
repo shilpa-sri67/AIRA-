@@ -20,16 +20,16 @@ MODEL = "gemini-3.5-transcribe-live"
 
 MIC_DEVICE = 1
 
-# Microphone's native sample rate
 INPUT_RATE = 44100
-
-# Gemini's required audio sample rate
 OUTPUT_RATE = 16000
 
 CHANNELS = 1
-BLOCK_SIZE = 882  # 20 milliseconds at 44.1 kHz
+BLOCK_SIZE = 4410
 
 QUEUE_SIZE = 200
+
+RECONNECT_DELAY = 2
+MAX_RECONNECT_DELAY = 30
 
 
 # ==================================================
@@ -53,6 +53,7 @@ if not API_KEY:
 client = genai.Client(api_key=API_KEY)
 
 config = types.LiveConnectConfig(
+
     response_modalities=["TEXT"],
 
     input_audio_transcription=types.AudioTranscriptionConfig(
@@ -63,12 +64,30 @@ config = types.LiveConnectConfig(
 
 
 # ==================================================
-# AUDIO STREAMING
+# AUDIO QUEUE
 # ==================================================
 
-async def microphone_sender(session, audio_queue):
+def enqueue_audio(audio_queue, audio_data):
 
-    loop = asyncio.get_running_loop()
+    # Prevent unlimited audio accumulation.
+
+    if audio_queue.full():
+
+        try:
+            audio_queue.get_nowait()
+            audio_queue.task_done()
+
+        except asyncio.QueueEmpty:
+            pass
+
+    audio_queue.put_nowait(audio_data)
+
+
+# ==================================================
+# MICROPHONE CAPTURE
+# ==================================================
+
+def create_microphone_stream(audio_queue, loop):
 
     def microphone_callback(indata, frames, time_info, status):
 
@@ -77,42 +96,62 @@ async def microphone_sender(session, audio_queue):
 
         audio_data = bytes(indata)
 
-        def enqueue():
-            if not audio_queue.full():
-                audio_queue.put_nowait(audio_data)
+        try:
+            loop.call_soon_threadsafe(
+                enqueue_audio,
+                audio_queue,
+                audio_data
+            )
 
-        loop.call_soon_threadsafe(enqueue)
+        except RuntimeError:
+            pass
 
-    print("\nStarting microphone...")
+    stream = sd.RawInputStream(
 
-    # State is maintained between chunks so resampling
-    # remains continuous.
+        device=MIC_DEVICE,
+
+        samplerate=INPUT_RATE,
+
+        channels=CHANNELS,
+
+        dtype="int16",
+
+        blocksize=BLOCK_SIZE,
+
+        callback=microphone_callback
+    )
+
+    return stream
+
+
+# ==================================================
+# AUDIO SENDER
+# ==================================================
+
+async def microphone_sender(session, audio_queue):
 
     resample_state = None
 
-    with sd.RawInputStream(
-        device=MIC_DEVICE,
-        samplerate=INPUT_RATE,
-        channels=CHANNELS,
-        dtype="int16",
-        blocksize=BLOCK_SIZE,
-        callback=microphone_callback
-    ):
+    print("\nGemini audio sender started.")
 
-        print("Microphone ready.")
-        print("AIRA is listening...\n")
+    while True:
 
-        while True:
+        audio_data = await audio_queue.get()
 
-            audio_data = await audio_queue.get()
+        try:
 
-            # Convert 44.1 kHz audio to 16 kHz.
             converted_audio, resample_state = audioop.ratecv(
+
                 audio_data,
+
                 2,
+
                 CHANNELS,
+
                 INPUT_RATE,
+
                 OUTPUT_RATE,
+
                 resample_state
             )
 
@@ -120,55 +159,205 @@ async def microphone_sender(session, audio_queue):
                 continue
 
             await session.send_realtime_input(
+
                 audio=types.Blob(
+
                     data=converted_audio,
+
                     mime_type="audio/pcm;rate=16000"
                 )
             )
 
+        finally:
+
+            audio_queue.task_done()
+
 
 # ==================================================
-# RECEIVE TRANSCRIPTIONS
+# TRANSCRIPTION RECEIVER
 # ==================================================
 
 async def transcription_receiver(session):
 
-    while True:
+    print("Gemini transcription receiver started.")
 
-        async for response in session.receive():
+    async for response in session.receive():
 
-            content = response.server_content
+        # Check whether Gemini is about to terminate
+        # the current connection.
 
-            if content is None:
-                continue
+        if response.go_away is not None:
 
-            # Only finalized transcripts are displayed.
+            print("\nGemini is closing this connection.")
 
-            transcription = content.input_transcription
+            print(
+                "Time remaining:",
+                response.go_away.time_left
+            )
 
-            if transcription and transcription.text:
+            return
 
-                text = transcription.text.strip()
+        content = response.server_content
 
-                if text:
+        if content is None:
+            continue
 
-                    timestamp = datetime.now().strftime(
-                        "%H:%M:%S"
-                    )
+        transcription = content.input_transcription
 
-                    print("\n" + "-" * 50)
+        if transcription and transcription.text:
 
-                    print(
-                        f"[{timestamp}] YOU: {text}"
-                    )
+            text = transcription.text.strip()
 
-                    print("-" * 50)
+            if text:
 
-                    print("\nAIRA is listening...")
+                timestamp = datetime.now().strftime(
+                    "%H:%M:%S"
+                )
+
+                print("\n" + "-" * 55)
+
+                print(
+                    f"[{timestamp}] YOU: {text}"
+                )
+
+                print("-" * 55)
+
+                print("\nAIRA is listening...")
 
 
 # ==================================================
-# MAIN SESSION
+# RUN ONE GEMINI SESSION
+# ==================================================
+
+async def run_gemini_session(audio_queue):
+
+    async with client.aio.live.connect(
+
+        model=MODEL,
+
+        config=config
+
+    ) as session:
+
+        print("\nGemini connected successfully!")
+
+        print("Starting transcription...")
+
+        sender_task = asyncio.create_task(
+
+            microphone_sender(
+                session,
+                audio_queue
+            )
+
+        )
+
+        receiver_task = asyncio.create_task(
+
+            transcription_receiver(session)
+
+        )
+
+        tasks = [sender_task, receiver_task]
+
+        try:
+
+            done, pending = await asyncio.wait(
+
+                tasks,
+
+                return_when=asyncio.FIRST_COMPLETED
+
+            )
+
+            # Stop the other task when either
+            # side terminates.
+
+            for task in pending:
+                task.cancel()
+
+            await asyncio.gather(
+                *pending,
+                return_exceptions=True
+            )
+
+            # Propagate actual sender/receiver errors.
+
+            for task in done:
+
+                exception = task.exception()
+
+                if exception:
+                    raise exception
+
+            # A normal receiver exit also means
+            # this session needs replacing.
+
+            raise ConnectionError(
+                "Gemini session ended."
+            )
+
+        finally:
+
+            for task in tasks:
+
+                if not task.done():
+                    task.cancel()
+
+            await asyncio.gather(
+                *tasks,
+                return_exceptions=True
+            )
+
+
+# ==================================================
+# AUTOMATIC RECONNECTION
+# ==================================================
+
+async def connection_manager(audio_queue):
+
+    retry_delay = RECONNECT_DELAY
+
+    while True:
+
+        try:
+
+            print("\nConnecting to Gemini Live...")
+
+            await run_gemini_session(audio_queue)
+
+            retry_delay = RECONNECT_DELAY
+
+        except asyncio.CancelledError:
+
+            raise
+
+        except Exception as error:
+
+            print("\n" + "=" * 55)
+
+            print("GEMINI CONNECTION INTERRUPTED")
+
+            print("Error:", type(error).__name__)
+
+            print("Details:", error)
+
+            print(
+                f"\nReconnecting in {retry_delay} seconds..."
+            )
+
+            print("=" * 55)
+
+            await asyncio.sleep(retry_delay)
+
+            retry_delay = min(
+                retry_delay * 2,
+                MAX_RECONNECT_DELAY
+            )
+
+
+# ==================================================
+# MAIN
 # ==================================================
 
 async def main():
@@ -177,36 +366,43 @@ async def main():
         maxsize=QUEUE_SIZE
     )
 
+    loop = asyncio.get_running_loop()
+
     print("\n====================================")
     print("       AIRA LIVE TRANSCRIPTION")
     print("====================================")
 
     print("Model:", MODEL)
+
     print("Microphone:", MIC_DEVICE)
+
     print("Input:", INPUT_RATE, "Hz")
+
     print("Output:", OUTPUT_RATE, "Hz")
 
-    print("\nConnecting to Gemini Live...")
+    print("\nInitializing microphone...")
 
-    async with client.aio.live.connect(
-        model=MODEL,
-        config=config
-    ) as session:
+    stream = create_microphone_stream(
+        audio_queue,
+        loop
+    )
 
-        print("\nGemini connected successfully!")
+    try:
 
-        await asyncio.gather(
+        with stream:
 
-            microphone_sender(
-                session,
-                audio_queue
-            ),
+            print("\nMicrophone ready.")
 
-            transcription_receiver(
-                session
-            )
+            print("AIRA is listening...\n")
 
-        )
+            await connection_manager(audio_queue)
+
+    finally:
+
+        if stream.active:
+            stream.stop()
+
+        stream.close()
 
 
 # ==================================================
@@ -221,10 +417,12 @@ if __name__ == "__main__":
 
     except KeyboardInterrupt:
 
-        print("\n\nAIRA stopped.")
+        print("\n\nAIRA stopped by user.")
 
     except Exception as error:
 
-        print("\nAIRA ERROR")
+        print("\nAIRA FATAL ERROR")
+
         print("Type:", type(error).__name__)
+
         print("Details:", error)

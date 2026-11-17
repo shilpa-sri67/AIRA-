@@ -1,3 +1,6 @@
+# AIRA-
+jarvis like ai
+
 # AIRA AI Assistant Backend
 
 Modular, real-time AI Assistant architecture powered by **Gemini 3.8 Flash**, featuring live voice transcription, function calling tool router (OS, App, IoT), execution verification, and real-time speech synthesis.
