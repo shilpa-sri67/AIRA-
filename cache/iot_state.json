@@ -1,0 +1,57 @@
+{
+  "lights": {
+    "living_room": {
+      "name": "Living Room Light",
+      "state": "on",
+      "brightness": 70,
+      "color": "warm white"
+    },
+    "bedroom": {
+      "name": "Bedroom Light",
+      "state": "off",
+      "brightness": 60,
+      "color": "soft amber"
+    },
+    "studio": {
+      "name": "Studio & Desk Light",
+      "state": "on",
+      "brightness": 100,
+      "color": "daylight cyan"
+    },
+    "kitchen": {
+      "name": "Kitchen Ceiling Light",
+      "state": "off",
+      "brightness": 90,
+      "color": "white"
+    }
+  },
+  "plugs": {
+    "desk_charger": {
+      "name": "Desk Charger Plug",
+      "state": "on",
+      "current_watts": 45
+    },
+    "coffee_maker": {
+      "name": "Smart Coffee Maker",
+      "state": "off",
+      "current_watts": 0
+    },
+    "fan": {
+      "name": "Tower Fan",
+      "state": "off",
+      "current_watts": 0
+    }
+  },
+  "thermostat": {
+    "current_temp": 24,
+    "target_temp": 22,
+    "mode": "cool",
+    "fan_speed": "auto"
+  },
+  "curtains": {
+    "studio_blinds": {
+      "name": "Studio Blinds",
+      "position": 100
+    }
+  }
+}
